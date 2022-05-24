@@ -1,0 +1,148 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: ---
+Resources: 
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select [ 0, "Fn::GetAZs": {Ref: "AWS::Region"}]
+      CidrBlock: 10.0.0.0/24
+      VpcId: !Ref VPC
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${AWS::StackName}-ftp-sg
+      GroupDescription: ---
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 21
+          ToPort: 21
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: tcp
+          FromPort: 8192
+          ToPort: 8200
+          CidrIp: 10.0.0.0/16
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn: AttachGateway
+    Properties:
+      VpcId: !Ref VPC
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  FTP:
+    Type: AWS::Transfer::Server
+    Properties: 
+      Domain: S3
+      Protocols: 
+        - FTP
+      EndpointType: VPC
+      EndpointDetails: 
+        SecurityGroupIds: 
+          - !Ref SecurityGroup
+        SubnetIds: 
+          - !Ref PublicSubnet
+        VpcId: !Ref VPC
+      IdentityProviderType: AWS_LAMBDA
+      IdentityProviderDetails: 
+        Function: !GetAtt lambdaFunction.Arn
+  
+  lambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-auth-lambda
+      Role: !GetAtt lambdaExecutionRole.Arn
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      Code:
+        ZipFile: !Sub
+        - |
+          def lambda_handler(event, context):
+            if event["username"] == "hoge" and event["password"] == "fuga":
+                return { 
+                  'Role': '${lambdaReturnRole}',
+                  'Policy': '',
+                  'HomeDirectory': '/${bucketName}/'
+                }
+            else:
+                return {}
+        - { lambdaReturnRole: !GetAtt lambdaReturnRole.Arn, bucketName: !Ref S3Bucket }
+  lambdaFunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt lambdaFunction.Arn
+      Principal: transfer.amazonaws.com
+      SourceArn: !GetAtt FTP.Arn
+  lambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: 
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  lambdaReturnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: 
+              Service: transfer.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              Effect: Allow
+              Action:
+                - s3:ListBucket
+                - s3:PutObject
+                - s3:GetObject
+                - s3:DeleteObject
+                - s3:DeleteObjectVersion
+                - s3:GetBucketLocation
+                - s3:GetObjectVersion
+              Resource:
+                - !GetAtt S3Bucket.Arn
+                - !Join [ '', [!GetAtt S3Bucket.Arn, '/*']]
+          PolicyName: !Sub ${AWS::StackName}-Lambda-S3Access-Policy
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties: 
+      AccessControl: Private
+      BucketName: !Sub s3-${AWS::StackName}-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
